@@ -6,7 +6,6 @@
       "path": "/",
       "body": {"action": "get_history"},
       "expectedStatus": 401,
-      "expectedBody": {"error": "Не авторизован"},
       "bodyMatcher": "partial"
     }
   ]

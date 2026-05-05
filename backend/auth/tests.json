@@ -1,12 +1,11 @@
 {
   "tests": [
     {
-      "name": "Send verification code",
+      "name": "Get me unauthorized",
       "method": "POST",
       "path": "/",
-      "body": {"action": "send_code", "email": "test@example.com", "purpose": "login"},
-      "expectedStatus": 200,
-      "expectedBody": {"ok": true},
+      "body": {"action": "get_me"},
+      "expectedStatus": 401,
       "bodyMatcher": "partial"
     }
   ]

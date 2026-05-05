@@ -1,11 +1,12 @@
 """
-Chat функция: отправка сообщений в OxiwisAI API, сохранение истории.
-Действия: send_message, get_history, get_chat, delete_chat
+Chat: отправка сообщений OxiwisAI, история чатов, лимит 256 запросов/сутки по МСК.
+Поддерживает режим рассуждения (thinking mode).
 """
 import json
 import os
 import urllib.request
 import psycopg2
+from datetime import datetime, timezone, timedelta
 
 SCHEMA = os.environ.get('MAIN_DB_SCHEMA', 'public')
 CORS = {
@@ -16,6 +17,8 @@ CORS = {
 
 OXIWIS_API_URL = 'https://jpdwcpxlotztzrqcgfeg.supabase.co/functions/v1/v1-chat'
 OXIWIS_API_KEY = 'ypr_OBqnJxMDLkBWn3IztUOX6dcuW8hH3AfeUHrOAku7X3k'
+DAILY_LIMIT = 256
+MSK = timezone(timedelta(hours=3))
 
 
 def get_conn():
@@ -30,13 +33,57 @@ def get_user_from_token(cur, token: str):
     return cur.fetchone()
 
 
-def call_oxiwis(messages: list) -> str:
-    payload = json.dumps({
+def get_msk_day() -> str:
+    return datetime.now(MSK).strftime('%Y-%m-%d')
+
+
+def check_and_increment_limit(cur, conn, user_id: str) -> tuple[bool, int]:
+    today = get_msk_day()
+    cur.execute(
+        f"SELECT requests_count FROM {SCHEMA}.daily_limits WHERE user_id=%s AND day=%s",
+        (user_id, today)
+    )
+    row = cur.fetchone()
+    count = row[0] if row else 0
+
+    if count >= DAILY_LIMIT:
+        return False, count
+
+    if row:
+        cur.execute(
+            f"UPDATE {SCHEMA}.daily_limits SET requests_count=requests_count+1 WHERE user_id=%s AND day=%s",
+            (user_id, today)
+        )
+    else:
+        cur.execute(
+            f"INSERT INTO {SCHEMA}.daily_limits (user_id, day, requests_count) VALUES (%s, %s, 1)",
+            (user_id, today)
+        )
+    conn.commit()
+    return True, count + 1
+
+
+def get_limit_info(cur, user_id: str) -> dict:
+    today = get_msk_day()
+    cur.execute(
+        f"SELECT requests_count FROM {SCHEMA}.daily_limits WHERE user_id=%s AND day=%s",
+        (user_id, today)
+    )
+    row = cur.fetchone()
+    used = row[0] if row else 0
+    return {'used': used, 'limit': DAILY_LIMIT, 'remaining': max(0, DAILY_LIMIT - used)}
+
+
+def call_oxiwis(messages: list, thinking_mode: bool = False) -> str:
+    payload_data = {
         'model': 'OxiwisAI',
         'messages': messages,
-        'stream': False
-    }).encode('utf-8')
+        'stream': False,
+    }
+    if thinking_mode:
+        payload_data['thinking'] = True
 
+    payload = json.dumps(payload_data).encode('utf-8')
     req = urllib.request.Request(
         OXIWIS_API_URL,
         data=payload,
@@ -46,11 +93,17 @@ def call_oxiwis(messages: list) -> str:
         },
         method='POST'
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read().decode('utf-8'))
 
     if 'choices' in data and data['choices']:
-        return data['choices'][0]['message']['content']
+        choice = data['choices'][0]
+        msg = choice.get('message', {})
+        thinking = msg.get('thinking', '')
+        content = msg.get('content', '')
+        if thinking and thinking_mode:
+            return json.dumps({'thinking': thinking, 'content': content})
+        return content
     if 'message' in data:
         msg = data['message']
         if isinstance(msg, dict):
@@ -73,25 +126,35 @@ def handler(event: dict, context) -> dict:
     try:
         user = get_user_from_token(cur, token) if token else None
         if not user:
-            return {'statusCode': 401, 'headers': CORS, 'body': json.dumps({'error': 'Не авторизован'})}
+            return {'statusCode': 401, 'headers': CORS, 'body': json.dumps({'error': 'Unauthorized'})}
 
-        user_id = user[0]
+        user_id = str(user[0])
 
         # --- SEND MESSAGE ---
         if action == 'send_message':
             chat_id = body.get('chat_id')
             user_message = body.get('message', '').strip()
+            thinking_mode = bool(body.get('thinking_mode', False))
+
             if not user_message:
-                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Сообщение пустое'})}
+                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Empty message'})}
+
+            allowed, count = check_and_increment_limit(cur, conn, user_id)
+            if not allowed:
+                return {'statusCode': 429, 'headers': CORS, 'body': json.dumps({
+                    'error': 'Daily limit reached',
+                    'limit': DAILY_LIMIT,
+                    'used': count
+                })}
 
             if chat_id:
                 cur.execute(
                     f"SELECT id, messages, title FROM {SCHEMA}.chat_history WHERE id=%s AND user_id=%s",
-                    (chat_id, str(user_id))
+                    (chat_id, user_id)
                 )
                 chat_row = cur.fetchone()
                 if not chat_row:
-                    return {'statusCode': 404, 'headers': CORS, 'body': json.dumps({'error': 'Чат не найден'})}
+                    return {'statusCode': 404, 'headers': CORS, 'body': json.dumps({'error': 'Chat not found'})}
                 db_chat_id, existing_messages, title = chat_row
                 messages = existing_messages if isinstance(existing_messages, list) else []
             else:
@@ -100,8 +163,20 @@ def handler(event: dict, context) -> dict:
                 db_chat_id = None
 
             messages.append({'role': 'user', 'content': user_message})
-            ai_reply = call_oxiwis(messages)
-            messages.append({'role': 'assistant', 'content': ai_reply})
+            raw_reply = call_oxiwis(messages, thinking_mode)
+
+            thinking_text = None
+            reply_text = raw_reply
+
+            if thinking_mode and raw_reply.startswith('{'):
+                try:
+                    parsed = json.loads(raw_reply)
+                    thinking_text = parsed.get('thinking', '')
+                    reply_text = parsed.get('content', raw_reply)
+                except Exception:
+                    pass
+
+            messages.append({'role': 'assistant', 'content': reply_text})
 
             if db_chat_id:
                 cur.execute(
@@ -111,47 +186,63 @@ def handler(event: dict, context) -> dict:
             else:
                 cur.execute(
                     f"INSERT INTO {SCHEMA}.chat_history (user_id, title, messages) VALUES (%s, %s, %s) RETURNING id",
-                    (str(user_id), title, json.dumps(messages))
+                    (user_id, title, json.dumps(messages))
                 )
                 db_chat_id = cur.fetchone()[0]
 
             conn.commit()
-            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
-                'ok': True, 'reply': ai_reply, 'chat_id': str(db_chat_id), 'messages': messages
-            })}
+            limit_info = get_limit_info(cur, user_id)
+
+            result = {
+                'ok': True,
+                'reply': reply_text,
+                'chat_id': str(db_chat_id),
+                'messages': messages,
+                'limit': limit_info,
+            }
+            if thinking_text:
+                result['thinking'] = thinking_text
+
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps(result)}
+
+        # --- GET LIMIT ---
+        elif action == 'get_limit':
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True, 'limit': get_limit_info(cur, user_id)})}
 
         # --- GET HISTORY ---
         elif action == 'get_history':
             cur.execute(
                 f"SELECT id, title, created_at, updated_at FROM {SCHEMA}.chat_history WHERE user_id=%s ORDER BY updated_at DESC LIMIT 50",
-                (str(user_id),)
+                (user_id,)
             )
             rows = cur.fetchall()
             chats = [{'id': str(r[0]), 'title': r[1], 'created_at': str(r[2]), 'updated_at': str(r[3])} for r in rows]
-            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True, 'chats': chats})}
+            limit_info = get_limit_info(cur, user_id)
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True, 'chats': chats, 'limit': limit_info})}
 
         # --- GET CHAT ---
         elif action == 'get_chat':
             chat_id = body.get('chat_id')
             cur.execute(
                 f"SELECT id, title, messages, created_at FROM {SCHEMA}.chat_history WHERE id=%s AND user_id=%s",
-                (chat_id, str(user_id))
+                (chat_id, user_id)
             )
             row = cur.fetchone()
             if not row:
-                return {'statusCode': 404, 'headers': CORS, 'body': json.dumps({'error': 'Чат не найден'})}
+                return {'statusCode': 404, 'headers': CORS, 'body': json.dumps({'error': 'Chat not found'})}
             return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
-                'ok': True, 'chat': {'id': str(row[0]), 'title': row[1], 'messages': row[2], 'created_at': str(row[3])}
+                'ok': True,
+                'chat': {'id': str(row[0]), 'title': row[1], 'messages': row[2], 'created_at': str(row[3])}
             })}
 
         # --- DELETE CHAT ---
         elif action == 'delete_chat':
             chat_id = body.get('chat_id')
-            cur.execute(f"DELETE FROM {SCHEMA}.chat_history WHERE id=%s AND user_id=%s", (chat_id, str(user_id)))
+            cur.execute(f"DELETE FROM {SCHEMA}.chat_history WHERE id=%s AND user_id=%s", (chat_id, user_id))
             conn.commit()
             return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True})}
 
-        return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Неизвестное действие'})}
+        return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Unknown action'})}
 
     finally:
         cur.close()

@@ -6,49 +6,42 @@ function getToken(): string {
 }
 
 async function callAuth(body: object) {
+  const token = getToken();
   const res = await fetch(AUTH_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getToken()}` },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify(body),
   });
   return res.json();
 }
 
 async function callChat(body: object) {
+  const token = getToken();
   const res = await fetch(CHAT_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getToken()}` },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify(body),
   });
   return res.json();
 }
 
 export const api = {
-  sendCode: (email: string, purpose: 'login' | 'register') =>
-    callAuth({ action: 'send_code', email, purpose }),
-
-  verifyCode: (email: string, code: string) =>
-    callAuth({ action: 'verify_code', email, code }),
-
-  register: (email: string, code: string, name: string, password: string, enable_2fa: boolean) =>
-    callAuth({ action: 'register', email, code, name, password, enable_2fa }),
-
-  login: (email: string, code: string, password?: string) =>
-    callAuth({ action: 'login', email, code, password }),
-
+  sendCode: (email: string) => callAuth({ action: 'send_code', email }),
+  login: (email: string, code: string) => callAuth({ action: 'login', email, code }),
   getMe: () => callAuth({ action: 'get_me' }),
-
-  updateProfile: (data: { name?: string; password?: string; enable_2fa?: boolean }) =>
-    callAuth({ action: 'update_profile', ...data }),
-
+  updateName: (name: string) => callAuth({ action: 'update_name', name }),
   logout: () => callAuth({ action: 'logout' }),
 
-  sendMessage: (message: string, chat_id?: string) =>
-    callChat({ action: 'send_message', message, chat_id }),
-
+  sendMessage: (message: string, chat_id?: string, thinking_mode?: boolean) =>
+    callChat({ action: 'send_message', message, chat_id, thinking_mode: !!thinking_mode }),
   getHistory: () => callChat({ action: 'get_history' }),
-
   getChat: (chat_id: string) => callChat({ action: 'get_chat', chat_id }),
-
   deleteChat: (chat_id: string) => callChat({ action: 'delete_chat', chat_id }),
+  getLimit: () => callChat({ action: 'get_limit' }),
 };
