@@ -1,10 +1,12 @@
 {
   "tests": [
     {
-      "name": "Get chats unauthorized",
-      "method": "GET",
+      "name": "Get history unauthorized",
+      "method": "POST",
       "path": "/",
+      "body": {"action": "get_history"},
       "expectedStatus": 401,
+      "expectedBody": {"error": "Не авторизован"},
       "bodyMatcher": "partial"
     }
   ]

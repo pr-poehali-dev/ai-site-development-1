@@ -1,25 +1,24 @@
 """
-Аутентификация пользователей OxiwisAI: регистрация, вход, верификация кода, сессии.
+Auth функция: регистрация, вход, верификация email-кода, 2FA.
+Действия: send_code, verify_code, register, login, verify_2fa, get_me, update_profile, logout
 """
 import json
 import os
 import random
 import string
 import hashlib
-import secrets
 import smtplib
+import secrets
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-
 import psycopg2
 
-SCHEMA = os.environ.get('MAIN_DB_SCHEMA', 't_p59434780_ai_site_development_')
-CORS_HEADERS = {
+SCHEMA = os.environ.get('MAIN_DB_SCHEMA', 'public')
+CORS = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-User-Id, X-Auth-Token, X-Session-Id',
-    'Access-Control-Max-Age': '86400',
+    'Access-Control-Allow-Headers': 'Content-Type, X-User-Id, X-Auth-Token, X-Session-Id, X-Authorization',
 }
 
 
@@ -27,30 +26,24 @@ def get_conn():
     return psycopg2.connect(os.environ['DATABASE_URL'])
 
 
-def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    h = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}:{h}"
-
-
-def verify_password(password: str, stored: str) -> bool:
-    parts = stored.split(':')
-    if len(parts) != 2:
-        return False
-    salt, h = parts
-    return hashlib.sha256((salt + password).encode()).hexdigest() == h
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
 
 
 def generate_code() -> str:
     return ''.join(random.choices(string.digits, k=6))
 
 
+def generate_token() -> str:
+    return secrets.token_hex(32)
+
+
 def send_email(to_email: str, subject: str, html_body: str):
-    gmail_user = os.environ.get('GMAIL_USER', '')
-    gmail_pass = os.environ.get('GMAIL_PASSWORD', '')
+    gmail_user = os.environ['GMAIL_USER']
+    gmail_pass = os.environ['GMAIL_PASSWORD']
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
-    msg['From'] = f"OxiwisAI <{gmail_user}>"
+    msg['From'] = f'OxiwisAI <{gmail_user}>'
     msg['To'] = to_email
     msg.attach(MIMEText(html_body, 'html'))
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
@@ -58,257 +51,209 @@ def send_email(to_email: str, subject: str, html_body: str):
         server.sendmail(gmail_user, to_email, msg.as_string())
 
 
-def send_code_email(to_email: str, code: str, purpose: str):
-    if purpose == 'register':
-        subject = 'Код подтверждения регистрации — OxiwisAI'
-        action = 'подтверждения регистрации'
-    elif purpose == 'login':
-        subject = 'Код для входа — OxiwisAI'
-        action = 'входа в аккаунт'
-    elif purpose == '2fa':
-        subject = 'Код двухфакторной аутентификации — OxiwisAI'
-        action = 'двухфакторной аутентификации'
-    else:
-        subject = 'Код подтверждения — OxiwisAI'
-        action = 'подтверждения'
-
-    html = f"""
-    <div style="background:#000;color:#fff;font-family:sans-serif;padding:40px;max-width:480px;margin:auto;border-radius:16px;">
-      <div style="text-align:center;margin-bottom:32px;">
-        <img src="https://cdn.poehali.dev/projects/bc51261c-a863-4d06-a23f-71157a55b74b/bucket/7e5e7698-9fd5-4062-aea0-5c3605825c09.jpg"
-             width="64" style="border-radius:12px;" />
-        <h2 style="margin:16px 0 4px;font-size:22px;font-weight:700;letter-spacing:2px;">OxiwisAI</h2>
-        <p style="color:#888;font-size:13px;margin:0;">by Oxiwis</p>
+def code_email_html(code: str, purpose: str) -> str:
+    purpose_text = 'входа' if purpose == 'login' else 'регистрации'
+    return f"""
+    <div style="background:#0a0a0a;padding:40px;font-family:'Helvetica Neue',Arial,sans-serif;color:#fff;max-width:520px;margin:0 auto;border-radius:16px;border:1px solid rgba(255,255,255,0.08)">
+      <div style="text-align:center;margin-bottom:32px">
+        <span style="font-size:28px;font-weight:300;letter-spacing:2px;color:#fff">OxiwisAI</span>
+        <div style="font-size:11px;color:#666;letter-spacing:3px;text-transform:uppercase;margin-top:4px">by Oxiwis</div>
       </div>
-      <p style="color:#ccc;margin-bottom:24px;">Ваш код для {action}:</p>
-      <div style="background:#111;border:1px solid #333;border-radius:12px;padding:24px;text-align:center;margin-bottom:24px;">
-        <span style="font-size:40px;font-weight:700;letter-spacing:12px;color:#fff;">{code}</span>
+      <p style="color:#aaa;font-size:14px;margin-bottom:24px;line-height:1.6">Ваш код для {purpose_text}:</p>
+      <div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:28px;text-align:center;letter-spacing:12px;font-size:36px;font-weight:700;color:#fff;margin-bottom:24px">
+        {code}
       </div>
-      <p style="color:#666;font-size:13px;">Код действителен 10 минут. Не передавайте его никому.</p>
+      <p style="color:#555;font-size:12px;text-align:center">Код действителен 10 минут. Не передавайте его никому.</p>
     </div>
     """
-    send_email(to_email, subject, html)
 
 
 def handler(event: dict, context) -> dict:
     if event.get('httpMethod') == 'OPTIONS':
-        return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': ''}
+        return {'statusCode': 200, 'headers': CORS, 'body': ''}
 
-    method = event.get('httpMethod', 'GET')
-    path = event.get('path', '/')
-    body = {}
-    if event.get('body'):
-        body = json.loads(event['body'])
-
+    body = json.loads(event.get('body') or '{}')
+    action = body.get('action', '')
     conn = get_conn()
     cur = conn.cursor()
 
     try:
-        # POST /send-code — отправить код на email
-        if method == 'POST' and '/send-code' in path:
+        # --- SEND CODE ---
+        if action == 'send_code':
             email = body.get('email', '').strip().lower()
-            purpose = body.get('purpose', 'register')
-
-            if not email:
-                return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Email обязателен'})}
-
-            if purpose == 'login':
-                cur.execute(f"SELECT id FROM {SCHEMA}.users WHERE email = %s", (email,))
-                if not cur.fetchone():
-                    return {'statusCode': 404, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Пользователь не найден'})}
+            purpose = body.get('purpose', 'login')
+            if not email or '@' not in email:
+                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Неверный email'})}
 
             code = generate_code()
-            expires_at = datetime.utcnow() + timedelta(minutes=10)
+            expires = datetime.utcnow() + timedelta(minutes=10)
 
             cur.execute(
+                f"UPDATE {SCHEMA}.email_codes SET used=true WHERE email=%s AND used=false",
+                (email,)
+            )
+            cur.execute(
                 f"INSERT INTO {SCHEMA}.email_codes (email, code, purpose, expires_at) VALUES (%s, %s, %s, %s)",
-                (email, code, purpose, expires_at)
+                (email, code, purpose, expires)
             )
             conn.commit()
 
-            send_code_email(email, code, purpose)
-            return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'ok': True})}
+            send_email(email, f'Ваш код OxiwisAI: {code}', code_email_html(code, purpose))
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True, 'message': 'Код отправлен'})}
 
-        # POST /verify-code — проверить код
-        elif method == 'POST' and '/verify-code' in path:
+        # --- VERIFY CODE (check only) ---
+        elif action == 'verify_code':
             email = body.get('email', '').strip().lower()
             code = body.get('code', '').strip()
-            purpose = body.get('purpose', 'register')
 
             cur.execute(
-                f"SELECT id FROM {SCHEMA}.email_codes WHERE email=%s AND code=%s AND purpose=%s AND used=FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
-                (email, code, purpose)
+                f"SELECT id FROM {SCHEMA}.email_codes WHERE email=%s AND code=%s AND used=false AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+                (email, code)
             )
             row = cur.fetchone()
             if not row:
-                return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Неверный или просроченный код'})}
+                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Неверный или истёкший код'})}
 
-            cur.execute(f"UPDATE {SCHEMA}.email_codes SET used=TRUE WHERE id=%s", (row[0],))
-            conn.commit()
-            return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'ok': True})}
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True, 'valid': True})}
 
-        # POST /register — регистрация
-        elif method == 'POST' and '/register' in path:
+        # --- REGISTER ---
+        elif action == 'register':
             email = body.get('email', '').strip().lower()
+            code = body.get('code', '').strip()
             name = body.get('name', '').strip()
             password = body.get('password', '')
-            has_2fa = body.get('has_2fa', False)
+            enable_2fa = body.get('enable_2fa', False)
 
-            if not email or not name:
-                return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Email и имя обязательны'})}
+            cur.execute(
+                f"SELECT id FROM {SCHEMA}.email_codes WHERE email=%s AND code=%s AND used=false AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+                (email, code)
+            )
+            code_row = cur.fetchone()
+            if not code_row:
+                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Неверный или истёкший код'})}
 
             cur.execute(f"SELECT id FROM {SCHEMA}.users WHERE email=%s", (email,))
             if cur.fetchone():
-                return {'statusCode': 409, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Пользователь уже существует'})}
+                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Email уже зарегистрирован'})}
 
-            password_hash = hash_password(password) if password else None
-
+            pw_hash = hash_password(password) if password else None
             cur.execute(
                 f"INSERT INTO {SCHEMA}.users (email, name, password_hash, has_2fa) VALUES (%s, %s, %s, %s) RETURNING id",
-                (email, name, password_hash, has_2fa)
+                (email, name or email.split('@')[0], pw_hash, enable_2fa and bool(password))
             )
             user_id = cur.fetchone()[0]
 
-            token = secrets.token_urlsafe(32)
-            expires_at = datetime.utcnow() + timedelta(days=30)
+            cur.execute(f"UPDATE {SCHEMA}.email_codes SET used=true WHERE id=%s", (code_row[0],))
+
+            token = generate_token()
+            expires = datetime.utcnow() + timedelta(days=30)
             cur.execute(
                 f"INSERT INTO {SCHEMA}.sessions (user_id, token, expires_at) VALUES (%s, %s, %s)",
-                (str(user_id), token, expires_at)
+                (str(user_id), token, expires)
             )
             conn.commit()
 
-            return {
-                'statusCode': 200,
-                'headers': CORS_HEADERS,
-                'body': json.dumps({'token': token, 'user': {'id': str(user_id), 'email': email, 'name': name, 'has_2fa': has_2fa}})
-            }
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
+                'ok': True, 'token': token, 'user': {
+                    'id': str(user_id), 'email': email, 'name': name or email.split('@')[0], 'has_2fa': enable_2fa and bool(password)
+                }
+            })}
 
-        # POST /login — вход
-        elif method == 'POST' and '/login' in path:
+        # --- LOGIN ---
+        elif action == 'login':
             email = body.get('email', '').strip().lower()
+            code = body.get('code', '').strip()
             password = body.get('password', '')
+
+            cur.execute(
+                f"SELECT id FROM {SCHEMA}.email_codes WHERE email=%s AND code=%s AND used=false AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+                (email, code)
+            )
+            code_row = cur.fetchone()
+            if not code_row:
+                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Неверный или истёкший код'})}
 
             cur.execute(f"SELECT id, name, password_hash, has_2fa FROM {SCHEMA}.users WHERE email=%s", (email,))
-            row = cur.fetchone()
-            if not row:
-                return {'statusCode': 404, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Пользователь не найден'})}
+            user = cur.fetchone()
+            if not user:
+                return {'statusCode': 404, 'headers': CORS, 'body': json.dumps({'error': 'Пользователь не найден'})}
 
-            user_id, name, password_hash, has_2fa = row
+            user_id, name, pw_hash, has_2fa = user
 
-            if password_hash and not verify_password(password, password_hash):
-                return {'statusCode': 401, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Неверный пароль'})}
+            if has_2fa and pw_hash:
+                if not password:
+                    return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True, 'require_2fa': True, 'email': email, 'code': code})}
+                if hash_password(password) != pw_hash:
+                    return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Неверный пароль'})}
 
-            if has_2fa:
-                return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'requires_2fa': True, 'email': email})}
+            cur.execute(f"UPDATE {SCHEMA}.email_codes SET used=true WHERE id=%s", (code_row[0],))
 
-            token = secrets.token_urlsafe(32)
-            expires_at = datetime.utcnow() + timedelta(days=30)
+            token = generate_token()
+            expires = datetime.utcnow() + timedelta(days=30)
             cur.execute(
                 f"INSERT INTO {SCHEMA}.sessions (user_id, token, expires_at) VALUES (%s, %s, %s)",
-                (str(user_id), token, expires_at)
+                (str(user_id), token, expires)
             )
             conn.commit()
 
-            return {
-                'statusCode': 200,
-                'headers': CORS_HEADERS,
-                'body': json.dumps({'token': token, 'user': {'id': str(user_id), 'email': email, 'name': name, 'has_2fa': has_2fa}})
-            }
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
+                'ok': True, 'token': token, 'user': {'id': str(user_id), 'email': email, 'name': name, 'has_2fa': has_2fa}
+            })}
 
-        # POST /login-2fa — вход с 2FA (код на почту)
-        elif method == 'POST' and '/login-2fa' in path:
-            email = body.get('email', '').strip().lower()
-
-            cur.execute(f"SELECT id, name, has_2fa FROM {SCHEMA}.users WHERE email=%s", (email,))
-            row = cur.fetchone()
-            if not row:
-                return {'statusCode': 404, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Пользователь не найден'})}
-
-            user_id, name, has_2fa = row
-            token = secrets.token_urlsafe(32)
-            expires_at = datetime.utcnow() + timedelta(days=30)
-            cur.execute(
-                f"INSERT INTO {SCHEMA}.sessions (user_id, token, expires_at) VALUES (%s, %s, %s)",
-                (str(user_id), token, expires_at)
-            )
-            conn.commit()
-
-            return {
-                'statusCode': 200,
-                'headers': CORS_HEADERS,
-                'body': json.dumps({'token': token, 'user': {'id': str(user_id), 'email': email, 'name': name, 'has_2fa': has_2fa}})
-            }
-
-        # GET /me — получить текущего пользователя
-        elif method == 'GET' and '/me' in path:
-            token = event.get('headers', {}).get('X-Auth-Token', '')
+        # --- GET ME ---
+        elif action == 'get_me':
+            token = (event.get('headers') or {}).get('x-authorization', '').replace('Bearer ', '')
             if not token:
-                return {'statusCode': 401, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Токен не передан'})}
+                return {'statusCode': 401, 'headers': CORS, 'body': json.dumps({'error': 'Не авторизован'})}
 
             cur.execute(
-                f"SELECT u.id, u.email, u.name, u.has_2fa FROM {SCHEMA}.sessions s JOIN {SCHEMA}.users u ON s.user_id=u.id WHERE s.token=%s AND s.expires_at > NOW()",
+                f"SELECT u.id, u.email, u.name, u.has_2fa, u.created_at FROM {SCHEMA}.sessions s JOIN {SCHEMA}.users u ON s.user_id=u.id WHERE s.token=%s AND s.expires_at > NOW()",
                 (token,)
             )
             row = cur.fetchone()
             if not row:
-                return {'statusCode': 401, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Сессия истекла'})}
+                return {'statusCode': 401, 'headers': CORS, 'body': json.dumps({'error': 'Сессия недействительна'})}
 
-            user_id, email, name, has_2fa = row
-            return {
-                'statusCode': 200,
-                'headers': CORS_HEADERS,
-                'body': json.dumps({'user': {'id': str(user_id), 'email': email, 'name': name, 'has_2fa': has_2fa}})
-            }
+            uid, email, name, has_2fa, created_at = row
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
+                'ok': True, 'user': {'id': str(uid), 'email': email, 'name': name, 'has_2fa': has_2fa, 'created_at': str(created_at)}
+            })}
 
-        # PUT /update-2fa — обновить 2FA настройки
-        elif method == 'PUT' and '/update-2fa' in path:
-            token = event.get('headers', {}).get('X-Auth-Token', '')
-            has_2fa = body.get('has_2fa', False)
-
+        # --- UPDATE PROFILE ---
+        elif action == 'update_profile':
+            token = (event.get('headers') or {}).get('x-authorization', '').replace('Bearer ', '')
             cur.execute(
                 f"SELECT u.id FROM {SCHEMA}.sessions s JOIN {SCHEMA}.users u ON s.user_id=u.id WHERE s.token=%s AND s.expires_at > NOW()",
                 (token,)
             )
             row = cur.fetchone()
             if not row:
-                return {'statusCode': 401, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Не авторизован'})}
-
-            cur.execute(f"UPDATE {SCHEMA}.users SET has_2fa=%s, updated_at=NOW() WHERE id=%s", (has_2fa, row[0]))
-            conn.commit()
-            return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'ok': True})}
-
-        # PUT /update-profile — обновить профиль
-        elif method == 'PUT' and '/update-profile' in path:
-            token = event.get('headers', {}).get('X-Auth-Token', '')
-            name = body.get('name', '').strip()
-            password = body.get('password', '')
-
-            cur.execute(
-                f"SELECT u.id FROM {SCHEMA}.sessions s JOIN {SCHEMA}.users u ON s.user_id=u.id WHERE s.token=%s AND s.expires_at > NOW()",
-                (token,)
-            )
-            row = cur.fetchone()
-            if not row:
-                return {'statusCode': 401, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Не авторизован'})}
+                return {'statusCode': 401, 'headers': CORS, 'body': json.dumps({'error': 'Не авторизован'})}
 
             user_id = row[0]
-            if name:
-                cur.execute(f"UPDATE {SCHEMA}.users SET name=%s, updated_at=NOW() WHERE id=%s", (name, user_id))
-            if password:
-                cur.execute(f"UPDATE {SCHEMA}.users SET password_hash=%s, updated_at=NOW() WHERE id=%s", (hash_password(password), user_id))
-            conn.commit()
-            return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'ok': True})}
+            name = body.get('name')
+            password = body.get('password')
+            enable_2fa = body.get('enable_2fa')
 
-        # POST /logout
-        elif method == 'POST' and '/logout' in path:
-            token = event.get('headers', {}).get('X-Auth-Token', '')
-            cur.execute(f"UPDATE {SCHEMA}.sessions SET expires_at=NOW() WHERE token=%s", (token,))
-            conn.commit()
-            return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'ok': True})}
+            if name is not None:
+                cur.execute(f"UPDATE {SCHEMA}.users SET name=%s, updated_at=NOW() WHERE id=%s", (name, str(user_id)))
+            if password is not None:
+                pw_hash = hash_password(password) if password else None
+                cur.execute(f"UPDATE {SCHEMA}.users SET password_hash=%s, updated_at=NOW() WHERE id=%s", (pw_hash, str(user_id)))
+            if enable_2fa is not None:
+                cur.execute(f"UPDATE {SCHEMA}.users SET has_2fa=%s, updated_at=NOW() WHERE id=%s", (enable_2fa, str(user_id)))
 
-        if method == 'GET':
-            return {'statusCode': 401, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Не авторизован'})}
-        return {'statusCode': 404, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Not found'})}
+            conn.commit()
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True})}
+
+        # --- LOGOUT ---
+        elif action == 'logout':
+            token = (event.get('headers') or {}).get('x-authorization', '').replace('Bearer ', '')
+            cur.execute(f"DELETE FROM {SCHEMA}.sessions WHERE token=%s", (token,))
+            conn.commit()
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'ok': True})}
+
+        return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Неизвестное действие'})}
 
     finally:
         cur.close()
